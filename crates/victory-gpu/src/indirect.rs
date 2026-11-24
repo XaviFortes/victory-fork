@@ -1158,10 +1158,21 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores(crate::host::CARD_COMPARE, 64);
+    }
+
+    /// The same of the compare with a group per piece.
+    #[test]
+    fn warp_wide_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores(crate::host::CARD_COMPARE_WIDE, 1);
+    }
+
+    /// `source` hashes `per_group` pieces with a group.
+    fn card_compare_stores(source: &str, per_group: u32) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -1187,7 +1198,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES.div_ceil(per_group), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1215,6 +1226,27 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every byte counts, a piece's first and last among them.
+        for (at, flagged) in [(0, [1, 0, 0]), (PIECE - 1, [1, 0, 0]), (PIECE, [0, 1, 0]), (2 * PIECE + 4096, [0, 0, 1]), (size - 1, [0, 0, 1])] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(!content[at]) };
+            assert_eq!(run(&mut warp, 2), flagged, "byte {at}");
+        }
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        // Two 16-byte steps that change places, in the steps of one thread
+        // or of two, and the same change in two threads.
+        for (a, b) in [(PIECE, PIECE + 16), (PIECE, PIECE + 1024), (PIECE + 48, PIECE + 5 * 1024 + 160)] {
+            for i in 0..16 {
+                // SAFETY: inside the mapping.
+                unsafe { std::ptr::swap(now_ptr.add(a + i), now_ptr.add(b + i)) };
+            }
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "{a} and {b}");
+        }
+        for at in [PIECE + 32, PIECE + 64] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(now_ptr.add(at).read_volatile() ^ 0x80) };
+        }
+        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
@@ -1225,11 +1257,20 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
-        use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
+        card_fetch_copies(crate::host::CARD_COMPARE, 64);
+    }
+
+    #[test]
+    fn warp_card_fetch_uses_wide_hash_flags_for_skewed_pieces() {
+        card_fetch_copies(crate::host::CARD_COMPARE_WIDE, 1);
+    }
+
+    fn card_fetch_copies(source: &str, pieces_per_group: u32) {
+        use crate::host::{CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         let fetch = compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
@@ -1261,7 +1302,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces.div_ceil(pieces_per_group), 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);

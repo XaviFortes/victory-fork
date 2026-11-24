@@ -59,6 +59,14 @@ frame. To compare the trial, hold the scene and settings fixed, then compare
 frame time, descriptor sync time, and buffer slots visited. The capture
 used `VICTORY_CARD_REHASH_RUNS=1` throughout the sampled gameplay.
 
+A later capture with the descriptor trial reached a 147 ms gameplay window
+with about 4,100 draws per frame. Its GPU send-and-hash lists took about
+20–24 ms per frame near the end. To test the parallel hash from
+[upstream PR #253](https://github.com/fxceless/victory-fork/pull/253), run the
+same scene with `VICTORY_CARD_HASH_WIDE=0` and `VICTORY_CARD_HASH_WIDE=1` in
+separate launches. Keep `VICTORY_CARD_REHASH_RUNS=1` in both to match the
+capture. Compare median frame time and GPU send-and-hash and compare times.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
@@ -524,6 +532,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_CARD_HASH_WIDE=1` | hashes each 64 KiB piece with a 64-thread group. Off by default. |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
