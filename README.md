@@ -12,8 +12,11 @@ developer or publisher.
 
 ## Local performance branch
 
-Use `perf/descriptor-sync` for this fork's performance changes. The local
-checkout tracks `fork/perf/descriptor-sync`. To update an existing checkout:
+`perf/descriptor-sync` is the baseline for this fork's performance changes.
+`perf/descriptor-heap` adds a trial of [upstream PR #1043](https://github.com/fxceless/victory-fork/pull/1043),
+which batches descriptor updates and avoids re-queueing buffer slots during
+the heap pass. The trial keeps the existing dimension-specific null views.
+To update the baseline checkout:
 
 ```powershell
 git switch perf/descriptor-sync
@@ -48,6 +51,13 @@ to your usual PowerShell launch command. Use a different filename for each
 run. Keep the startup output and gameplay section so the log includes any
 `Fills wait for flights again` warning alongside the `title memory read`
 wait times.
+
+The capture before the descriptor trial had a median of 229 ms across 13
+five-second summaries with 6,500 to 7,999 draws per frame. Its sampled
+descriptor sync times in the closing stretch were roughly 50–75 ms per
+frame. To compare the trial, hold the scene and settings fixed, then compare
+frame time, descriptor sync time, and buffer slots visited. The capture
+used `VICTORY_CARD_REHASH_RUNS=1` throughout the sampled gameplay.
 
 ## Credits
 
