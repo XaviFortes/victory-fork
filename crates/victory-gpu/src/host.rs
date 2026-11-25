@@ -2319,6 +2319,12 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// A source copy needs its last queued producer and any work before it.
+/// Its trailing writes and signals belong to the same prefix.
+fn copy_wait_prefix(fences: &[Option<u64>], completed: u64, producer: u64) -> usize {
+    landable(fences, completed.min(producer))
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -2564,6 +2570,8 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// Declared shader writes of flights being landed, for the copy-wait trace.
     landing_writes: Vec<FlightWrite>,
+    /// Source range of the copy blocking the current submission, if prioritized.
+    copy_wait_source: Option<(usize, usize)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2580,6 +2588,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing_writes: Vec::new(),
+    copy_wait_source: None,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2614,6 +2623,14 @@ static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::ato
 /// Actual wait counts and microseconds, by initial buffer-copy conflict.
 static COPY_WAITS: [[std::sync::atomic::AtomicU64; 2]; 3] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
+
+/// Ready relay batches shortened for a waiting source copy.
+static COPY_PRIORITY_SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn copy_wait_priority() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_WAIT_PRIORITY").is_some_and(|v| v == "1"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopyConflict {
@@ -3402,7 +3419,7 @@ fn late_threads() {
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> Option<u64> {
+fn relay_wait(why: usize, copy_source: Option<(usize, usize)>, done: impl Fn(&Line) -> bool) -> Option<u64> {
     let mut line = line();
     if done(&line) {
         return None;
@@ -3411,8 +3428,16 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> Option<u64> {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    // Only the owner of the submission lock supplies a source. Other
+    // waiters leave its priority in place.
+    if copy_source.is_some() {
+        line.copy_wait_source = copy_source;
+    }
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+    }
+    if copy_source.is_some() {
+        line.copy_wait_source = None;
     }
     drop(line);
     stood(waiting);
@@ -3471,10 +3496,26 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let mut n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
+                }
+                if let Some((from, to)) = line.copy_wait_source {
+                    // Keep FIFO order, including the writes and signals of
+                    // the last producer. Once that prefix lands, the normal
+                    // wait predicate checks all dependencies again.
+                    let producer = line.line.iter().rev().find_map(|item| match item {
+                        Late::Run(flight) if flight.back.iter().any(|(_, ranges)| {
+                            ranges.iter().any(|&(a, b)| a < b && a < to && b > from)
+                        }) => Some(flight.fence),
+                        _ => None,
+                    });
+                    let limit = producer.map_or(n, |fence| copy_wait_prefix(&fences, completed, fence));
+                    if limit < n {
+                        n = limit;
+                        COPY_PRIORITY_SPLITS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -3616,6 +3657,10 @@ fn late_line(frames: f64) {
             both_n as f64 / frames, both_us as f64 / (1000.0 * frames),
         );
     }
+    if copy_wait_priority() {
+        let splits = COPY_PRIORITY_SPLITS.swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!("relay batches shortened for buffer copy sources per frame (VICTORY_COPY_WAIT_PRIORITY=1): {splits:.2}");
+    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         let [again, noted] = [0, 1].map(|i| BESIDE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -3660,7 +3705,17 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{BlockedCopy, CopyConflict, continues, copy_conflict, join_ranges, last_copy_writers, touches};
+    use super::{BlockedCopy, CopyConflict, continues, copy_conflict, copy_wait_prefix, join_ranges, last_copy_writers, touches};
+
+    #[test]
+    fn copy_priority_keeps_fifo_and_the_producers_trailing_signals() {
+        let fences = [Some(5), None, Some(6), None, None, Some(7), None];
+        assert_eq!(copy_wait_prefix(&fences, 7, 6), 5);
+        assert_eq!(copy_wait_prefix(&fences, 7, 5), 2);
+        assert_eq!(copy_wait_prefix(&fences, 5, 6), 2);
+        assert_eq!(copy_wait_prefix(&fences, 4, 6), 0);
+        assert_eq!(copy_wait_prefix(&fences, 7, 7), fences.len());
+    }
 
     #[test]
     fn copy_waits_distinguish_source_destination_and_both() {
@@ -5370,7 +5425,7 @@ impl Host {
             self.settle(&mut submitted, WHY_WRITES);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
-            relay_wait(WHY_MOST, |line| line.lists < late_most());
+            relay_wait(WHY_MOST, None, |line| line.lists < late_most());
         } else if most {
             self.settle(&mut submitted, WHY_MOST);
         } else {
@@ -5437,7 +5492,7 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            return relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            return relay_wait(why, None, |line| line.line.is_empty() && !line.settling);
         }
         let was_working = working(true);
         let mut counted = false;
@@ -5600,7 +5655,10 @@ impl Host {
             let waited = if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none())
+                let source = copy
+                    .filter(|copy| copy.conflict == CopyConflict::Source && copy_wait_priority())
+                    .map(|copy| (copy.src, copy.src + copy.len));
+                relay_wait(why, source, |line| blocked_by(&line.written, runs, false).is_none())
             } else {
                 self.settle(&mut submitted, why)
             };

@@ -95,6 +95,14 @@ writes to each operand just before the wait. An empty dependency means no
 matching flight remained in that snapshot. Turn the trace off for timing
 comparisons.
 
+The wait trace recorded 649 source-only waits. Two 2 KiB source ranges
+accounted for 54% of their time. `VICTORY_COPY_WAIT_PRIORITY=1` tries
+shortening a relay batch to the last queued producer of a waiting source
+copy. Flights, writes, and signals still land in queue order. The copy
+still waits until its dependencies clear. Compare the switch at `0` and `1`
+in the same scene, using source-read wait time, the number of shortened
+batches, and frame time. The switch defaults to off.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
