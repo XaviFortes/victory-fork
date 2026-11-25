@@ -86,6 +86,15 @@ fallbacks there. Earlier in the run, 58 relay summaries recorded a slot
 overflow. When testing heavy streaming, try `VICTORY_CARD_FETCH_INFLIGHT_MB=128`
 and compare overflow counts against the default 64 MiB.
 
+The frame summary now splits measured buffer-copy waits into source reads,
+destination writes, and copies blocked on both. Each wait is charged to the
+conflict that first blocked preparation. Set `VICTORY_COPY_WAIT_TRACE=1`
+for a short capture of individual waits. The trace records copy addresses,
+length, elapsed wait, and the latest submission and fence found declaring
+writes to each operand just before the wait. An empty dependency means no
+matching flight remained in that snapshot. Turn the trace off for timing
+comparisons.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

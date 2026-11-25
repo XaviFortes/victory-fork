@@ -2525,6 +2525,21 @@ enum Late {
     Signal(usize, u64),
 }
 
+type FlightWrite = ((u64, u64), (usize, usize));
+
+fn flight_writes(items: &[Late]) -> impl Iterator<Item = FlightWrite> + '_ {
+    items.iter()
+        .filter_map(|item| match item {
+            Late::Run(flight) => Some(flight),
+            _ => None,
+        })
+        .flat_map(|flight| {
+            flight.back.iter().flat_map(move |(_, ranges)| {
+                ranges.iter().map(move |&range| ((flight.number, flight.fence), range))
+            })
+        })
+}
+
 struct Line {
     line: Vec<Late>,
     /// The title memory the flights' shaders may write (address, end), in
@@ -2547,6 +2562,8 @@ struct Line {
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// Declared shader writes of flights being landed, for the copy-wait trace.
+    landing_writes: Vec<FlightWrite>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2562,6 +2579,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    landing_writes: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2592,6 +2610,63 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// Actual wait counts and microseconds, by initial buffer-copy conflict.
+static COPY_WAITS: [[std::sync::atomic::AtomicU64; 2]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyConflict {
+    Source,
+    Destination,
+    Both,
+}
+
+fn copy_conflict(written: &[(usize, usize)], src: usize, dst: usize, len: usize) -> Option<CopyConflict> {
+    match (touches(written, src, src + len), touches(written, dst, dst + len)) {
+        (true, false) => Some(CopyConflict::Source),
+        (false, true) => Some(CopyConflict::Destination),
+        (true, true) => Some(CopyConflict::Both),
+        (false, false) => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlockedCopy {
+    conflict: CopyConflict,
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+enum LateBlock {
+    Copy(BlockedCopy),
+    Read,
+    Run,
+}
+
+fn trace_copy_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_WAIT_TRACE").is_some_and(|v| v == "1"))
+}
+
+/// Last submission and fence seen declaring writes over each operand.
+fn copy_wait_dependencies(copy: BlockedCopy) -> [Option<(u64, u64)>; 2] {
+    let line = line();
+    last_copy_writers(copy, flight_writes(&line.line).chain(line.landing_writes.iter().copied()))
+}
+
+fn last_copy_writers(copy: BlockedCopy, writes: impl Iterator<Item = FlightWrite>) -> [Option<(u64, u64)>; 2] {
+    let mut last = [None; 2];
+    for (flight, (from, to)) in writes {
+        for (hit, at) in last.iter_mut().zip([copy.src, copy.dst]) {
+            if from < to && from < at + copy.len && to > at {
+                *hit = (*hit).max(Some(flight));
+            }
+        }
+    }
+    last
+}
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
@@ -2644,7 +2719,7 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+fn late_blocked(runs: &[&HostList]) -> Option<LateBlock> {
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -2658,7 +2733,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<LateBlock> {
     if written.is_empty() {
         return None;
     }
@@ -2666,8 +2741,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    let writes_to_flight = touches(written, dst, dst + len);
-                    if writes_to_flight || touches(written, src, src + len) {
+                    if let Some(conflict) = copy_conflict(written, src, dst, len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
                         // (`fill_ahead`): run 210 looked at 197 such waits
@@ -2675,7 +2749,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !writes_to_flight && fill_ahead::on() {
+                        if conflict == CopyConflict::Source && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2686,7 +2760,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked_copy(written, dst, src, len);
                         }
-                        return Some(WHY_READ);
+                        return Some(LateBlock::Copy(BlockedCopy { conflict, src, dst, len }));
                     }
                 }
                 &Step::Fill(_, src, len) => {
@@ -2704,7 +2778,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked(written, src, len);
                         }
-                        return Some(WHY_READ);
+                        return Some(LateBlock::Read);
                     }
                 }
                 Step::Texture(staging) => {
@@ -2713,10 +2787,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        return Some(LateBlock::Read);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return Some(LateBlock::Run),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -3328,10 +3402,10 @@ fn late_threads() {
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> Option<u64> {
     let mut line = line();
     if done(&line) {
-        return;
+        return None;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
@@ -3347,6 +3421,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     submission_us(1, us);
+    Some(us)
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -3403,6 +3478,9 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                if trace_copy_waits() {
+                    line.landing_writes.extend(flight_writes(&items));
+                }
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -3528,6 +3606,16 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    let copy_waits = COPY_WAITS.each_ref().map(|stats| stats.each_ref().map(|stat| stat.swap(0, Ordering::Relaxed)));
+    if copy_waits.iter().flatten().any(|&value| value != 0) {
+        let [[source_n, source_us], [destination_n, destination_us], [both_n, both_us]] = copy_waits;
+        tracing::info!(
+            "buffer copy waits per frame by initial conflict: source reads {:.2} ({:.2} ms), destination writes {:.2} ({:.2} ms), both {:.2} ({:.2} ms)",
+            source_n as f64 / frames, source_us as f64 / (1000.0 * frames),
+            destination_n as f64 / frames, destination_us as f64 / (1000.0 * frames),
+            both_n as f64 / frames, both_us as f64 / (1000.0 * frames),
+        );
+    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         let [again, noted] = [0, 1].map(|i| BESIDE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -3572,7 +3660,25 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{BlockedCopy, CopyConflict, continues, copy_conflict, join_ranges, last_copy_writers, touches};
+
+    #[test]
+    fn copy_waits_distinguish_source_destination_and_both() {
+        let written = [(100, 200)];
+        assert_eq!(copy_conflict(&written, 96, 200, 8), Some(CopyConflict::Source));
+        assert_eq!(copy_conflict(&written, 200, 96, 8), Some(CopyConflict::Destination));
+        assert_eq!(copy_conflict(&written, 104, 120, 8), Some(CopyConflict::Both));
+        assert_eq!(copy_conflict(&written, 92, 200, 8), None);
+        assert_eq!(copy_conflict(&written, 104, 120, 0), None);
+    }
+
+    #[test]
+    fn copy_wait_trace_finds_the_latest_overlapping_submission_per_operand() {
+        let copy = BlockedCopy { conflict: CopyConflict::Both, src: 100, dst: 200, len: 16 };
+        let writes = [((4, 40), (110, 210)), ((9, 90), (216, 220)), ((3, 30), (104, 108)), ((6, 60), (208, 212))];
+        assert_eq!(last_copy_writers(copy, writes.into_iter()), [Some((4, 40)), Some((6, 60))]);
+        assert_eq!(last_copy_writers(copy, std::iter::empty()), [None, None]);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5032,10 +5138,12 @@ impl Host {
                 poke,
                 landed: kept,
                 in_hand,
+                landing_writes,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
+            landing_writes.clear();
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
@@ -5319,9 +5427,9 @@ impl Host {
     /// Everything in the air is settled, never the first flights alone:
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
-    fn settle(&self, submitted: &mut u64, why: usize) {
+    fn settle(&self, submitted: &mut u64, why: usize) -> Option<u64> {
         if !late() {
-            return;
+            return None;
         }
         if relay() {
             // Nothing is settled here: the thread that lands flights does
@@ -5329,11 +5437,11 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
-            return;
+            return relay_wait(why, |line| line.line.is_empty() && !line.settling);
         }
         let was_working = working(true);
         let mut counted = false;
+        let mut waited_us = 0;
         loop {
             let items = {
                 let mut line = line();
@@ -5370,6 +5478,7 @@ impl Host {
                     }
                 }
                 let gpu = waiting.elapsed();
+                waited_us += gpu.as_micros() as u64;
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
@@ -5457,6 +5566,7 @@ impl Host {
             }
         }
         working(was_working);
+        counted.then_some(waited_us)
     }
 
     /// [`Host::execute`], or with `late` the first half of
@@ -5480,13 +5590,37 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
+        } else if let Some(blocker) = late_blocked(runs) {
+            let (why, copy) = match blocker {
+                LateBlock::Copy(copy) => (WHY_READ, Some(copy)),
+                LateBlock::Read => (WHY_READ, None),
+                LateBlock::Run => (WHY_RUN, None),
+            };
+            let dependencies = copy.filter(|_| trace_copy_waits()).map(copy_wait_dependencies);
+            let waited = if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none())
             } else {
-                self.settle(&mut submitted, why);
+                self.settle(&mut submitted, why)
+            };
+            if let (Some(copy), Some(us)) = (copy, waited) {
+                let [count, elapsed] = &COPY_WAITS[copy.conflict as usize];
+                count.fetch_add(1, Ordering::Relaxed);
+                elapsed.fetch_add(us, Ordering::Relaxed);
+                if let Some([source, destination]) = dependencies {
+                    tracing::info!(
+                        frame = crate::frame::current(),
+                        conflict = ?copy.conflict,
+                        src = format_args!("{:#x}", copy.src),
+                        dst = format_args!("{:#x}", copy.dst),
+                        bytes = copy.len,
+                        wait_us = us,
+                        source_submission_and_fence = ?source,
+                        destination_submission_and_fence = ?destination,
+                        "buffer copy waited for in-flight title memory"
+                    );
+                }
             }
         }
         // Descriptors the title copied into placed heaps directly, before
