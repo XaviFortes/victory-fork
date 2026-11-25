@@ -42,6 +42,13 @@ frame time and the GPU's send-and-hash time in the same scene. Set
 `VICTORY_CARD_REHASH_RUNS` to `0` or `1` for a fixed run and keep the other
 settings identical.
 
+To save a run outside the checkout, append
+`2>&1 | Tee-Object -FilePath (Join-Path $env:TEMP 'victory-run.log')`
+to your usual PowerShell launch command. Use a different filename for each
+run. Keep the startup output and gameplay section so the log includes any
+`Fills wait for flights again` warning alongside the `title memory read`
+wait times.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

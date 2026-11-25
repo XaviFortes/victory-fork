@@ -2527,16 +2527,29 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+    let previous = ranges.len();
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+    if ranges.len() != previous {
+        sort_and_join_ranges(ranges);
+    }
+}
+
+/// Sort and join nonempty ranges in place so the submission and relay can
+/// keep using the same allocation while they hold the line lock.
+fn sort_and_join_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
+    let mut kept = 0;
+    for index in 0..ranges.len() {
+        let (from, to) = ranges[index];
+        match ranges[..kept].last_mut() {
             Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+            _ => {
+                ranges[kept] = (from, to);
+                kept += 1;
+            }
         }
     }
-    *ranges = out;
+    ranges.truncate(kept);
 }
 
 /// Whether anything is in the air.
@@ -2576,7 +2589,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    let writes_to_flight = touches(written, dst, dst + len);
+                    if writes_to_flight || touches(written, src, src + len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
                         // (`fill_ahead`): run 210 looked at 197 such waits
@@ -2584,7 +2598,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !writes_to_flight && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3348,16 +3362,16 @@ fn relay_worker() {
 /// are not done with here (each flight's are, afterwards).
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut spans = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
             continue;
         }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
         join_ranges(&mut spans, declared.iter().copied());
-        for &(from, to) in &spans {
+        for (from, to) in spans.drain(..) {
             shadow.relay_compared(from, to - from);
+            work.push((shadow.clone(), from, to));
         }
-        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
     }
     if work.is_empty() {
         return;
@@ -3509,6 +3523,12 @@ mod late_tests {
         assert_eq!(ranges, [(10, 25), (40, 60)]);
         join_ranges(&mut ranges, [(25, 40)]);
         assert_eq!(ranges, [(10, 60)]);
+        let storage = ranges.as_ptr();
+        join_ranges(&mut ranges, [(5, 12), (11, 15), (30, 24)]);
+        assert_eq!(ranges, [(5, 60)]);
+        assert_eq!(ranges.as_ptr(), storage);
+        join_ranges(&mut ranges, [(7, 7)]);
+        assert_eq!(ranges, [(5, 60)]);
         let ranges = [(10usize, 25usize), (40, 60), (100, 101)];
         for (from, to, hit) in [
             (0, 10, false),
@@ -4927,14 +4947,13 @@ impl Host {
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
-            let mut ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    written.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()).filter(|r| r.0 < r.1));
                 }
             }
-            join_ranges(written, ranges);
+            sort_and_join_ranges(written);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
