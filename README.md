@@ -10,6 +10,38 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Local performance branch
+
+Use `perf/descriptor-sync` for this fork's performance changes. The local
+checkout tracks `fork/perf/descriptor-sync`. To update an existing checkout:
+
+```powershell
+git switch perf/descriptor-sync
+git pull --ff-only
+```
+
+From the repository root, load [the recorded settings](victory-env.ps1) into
+the PowerShell session that will launch Victory:
+
+```powershell
+. .\victory-env.ps1
+```
+
+| Setting | Value | Effect |
+|---|---|---|
+| `VICTORY_ASYNC_SUBMIT` | `1` | Prepares and sends submissions on a dedicated thread. |
+| `VICTORY_BACK_OWN_VIEW` | `1` | Copies shader writes back through Victory's own view of title memory. |
+| `VICTORY_CARD_METER` | `1` | Measures GPU time by command-list category. |
+| `VICTORY_CARD_REHASH_RUNS` | `alt` | Alternates between separate and joined GPU hash passes every 20 seconds. |
+| `VICTORY_FRAME_LOG` | `1` | Logs frame times and their breakdown. |
+| `VICTORY_JOIN_PARTS` | `1` | Sends consecutive parts together in their original order. |
+
+One local run with these settings reached about 6 FPS (171 ms per frame).
+For a repeatable comparison, let the scene warm up, then compare median
+frame time and the GPU's send-and-hash time in the same scene. Set
+`VICTORY_CARD_REHASH_RUNS` to `0` or `1` for a fixed run and keep the other
+settings identical.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
