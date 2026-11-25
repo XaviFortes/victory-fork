@@ -1709,6 +1709,144 @@ pub(crate) fn inflight_slots(bytes: u64) -> u32 {
     1u32 << (63 - wanted.leading_zeros())
 }
 
+/// Worker count for parallel relay copy-back merges across disjoint buffers
+/// (`VICTORY_RELAY_PARALLEL=1` uses 4 workers, `2..=8` sets the count, `0` or
+/// unset stays sequential).
+fn relay_parallel_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let Some(raw) = std::env::var("VICTORY_RELAY_PARALLEL").ok() else {
+            return 0;
+        };
+        match raw.trim().parse::<usize>().ok() {
+            Some(0) | None => 0,
+            Some(1) => 4,
+            Some(n) => n.clamp(2, 8),
+        }
+    })
+}
+
+type InflightPiece = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
+
+struct RelayMergeJob {
+    groups: *const [Vec<InflightPiece>],
+    next: *const std::sync::atomic::AtomicUsize,
+    written: *const std::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: pointers in `RelayMergeJob` point to stack locals in `RelayMergePool::run`,
+// which blocks on `done_cv` until every worker has finished the generation (`remaining == 0`).
+unsafe impl Send for RelayMergeJob {}
+
+struct RelayMergeState {
+    epoch: u64,
+    remaining: usize,
+    job: Option<RelayMergeJob>,
+}
+
+struct RelayMergePool {
+    workers: usize,
+    shared: std::sync::Arc<(std::sync::Mutex<RelayMergeState>, std::sync::Condvar, std::sync::Condvar)>,
+}
+
+impl RelayMergePool {
+    fn get() -> Option<&'static Self> {
+        static POOL: OnceLock<Option<RelayMergePool>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let workers = relay_parallel_workers();
+            if workers == 0 {
+                return None;
+            }
+            let shared = std::sync::Arc::new((
+                std::sync::Mutex::new(RelayMergeState { epoch: 0, remaining: 0, job: None }),
+                std::sync::Condvar::new(),
+                std::sync::Condvar::new(),
+            ));
+            for i in 0..workers {
+                let s = shared.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("victory-relay-merge-{i}"))
+                    .spawn(move || {
+                        let mut my_epoch = 0u64;
+                        let mut title = Vec::new();
+                        loop {
+                            let (groups, next, written) = {
+                                let mut st = s.0.lock().unwrap_or_else(|e| e.into_inner());
+                                while st.epoch == my_epoch {
+                                    st = s.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                                }
+                                my_epoch = st.epoch;
+                                let Some(job) = st.job.as_ref() else {
+                                    continue;
+                                };
+                                (job.groups, job.next, job.written)
+                            };
+                            // SAFETY: valid until we decrement `remaining` below.
+                            let groups = unsafe { &*groups };
+                            let next = unsafe { &*next };
+                            let written = unsafe { &*written };
+                            let mut local = 0usize;
+                            loop {
+                                let idx = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(group) = groups.get(idx) else {
+                                    break;
+                                };
+                                for (shadow, lo, hi, at, after) in group {
+                                    let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                                    local += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                                }
+                            }
+                            if local != 0 {
+                                written.fetch_add(local, Ordering::Relaxed);
+                            }
+                            let mut st = s.0.lock().unwrap_or_else(|e| e.into_inner());
+                            st.remaining -= 1;
+                            if st.remaining == 0 {
+                                s.2.notify_one();
+                            }
+                        }
+                    });
+            }
+            tracing::info!(workers, "relay copy-back merges run in parallel across disjoint buffers (VICTORY_RELAY_PARALLEL)");
+            Some(RelayMergePool { workers, shared })
+        })
+        .as_ref()
+    }
+
+    fn run(&self, groups: &[Vec<InflightPiece>]) -> usize {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let written = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let mut st = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+            st.epoch = st.epoch.wrapping_add(1);
+            st.remaining = self.workers;
+            st.job = Some(RelayMergeJob { groups: groups as *const _, next: &next, written: &written });
+            self.shared.1.notify_all();
+        }
+        let mut title = Vec::new();
+        let mut local = 0usize;
+        loop {
+            let idx = next.fetch_add(1, Ordering::Relaxed);
+            let Some(group) = groups.get(idx) else {
+                break;
+            };
+            for (shadow, lo, hi, at, after) in group {
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                local += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            }
+        }
+        if local != 0 {
+            written.fetch_add(local, Ordering::Relaxed);
+        }
+        let mut st = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        while st.remaining > 0 {
+            st = self.shared.2.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.job = None;
+        written.load(Ordering::Relaxed)
+    }
+}
+
 /// [`CARD_FETCH`]'s table entry for a piece the compare did not flag.
 pub(crate) const INFLIGHT_NONE: u32 = 0xffff_ffff;
 
@@ -5070,15 +5208,37 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+        let bytes: u64 = pieces.iter().map(|(_, lo, hi, _, _)| (hi - lo) as u64).sum();
+        let written = if let Some(pool) = RelayMergePool::get().filter(|_| pieces.len() >= 2 && bytes >= (256 << 10)) {
+            let mut by_copy: std::collections::HashMap<usize, Vec<InflightPiece>> = std::collections::HashMap::new();
+            for piece in pieces.iter().cloned() {
+                let key = Arc::as_ptr(&piece.0) as usize;
+                by_copy.entry(key).or_default().push(piece);
+            }
+            if by_copy.len() >= 2 {
+                let mut groups: Vec<Vec<InflightPiece>> = by_copy.into_values().collect();
+                groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.iter().map(|(_, lo, hi, _, _)| hi - lo).sum::<usize>()));
+                pool.run(&groups)
+            } else {
+                let mut title = Vec::new();
+                let mut w = 0usize;
+                for (shadow, lo, hi, at, after) in &pieces {
+                    let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                    w += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                }
+                w
+            }
+        } else {
+            let mut title = Vec::new();
+            let mut w = 0usize;
+            for (shadow, lo, hi, at, after) in &pieces {
+                // SAFETY: inside the mapping of the slots (checked above); the
+                // copy into it ran in the plan's flight, which the card has run.
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                w += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            }
+            w
+        };
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
