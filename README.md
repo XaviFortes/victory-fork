@@ -78,6 +78,14 @@ For a separate readback comparison, keep `VICTORY_CARD_HASH_WIDE=1` and
 in separate launches with `VICTORY_QUEUE2=0`. Compare median frame time,
 relay fetch waits, and how often the in-flight path falls back to a fetch.
 
+In the follow-up captures, low-remap windows at 4,000–4,749 draws per frame
+had median frame times of 155 ms with in-flight fetch off and 135 ms with
+it on. The runs averaged different draw loads within that band. In-flight
+fetch removed the separate readback wait in those windows and logged no
+fallbacks there. Earlier in the run, 58 relay summaries recorded a slot
+overflow. When testing heavy streaming, try `VICTORY_CARD_FETCH_INFLIGHT_MB=128`
+and compare overflow counts against the default 64 MiB.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

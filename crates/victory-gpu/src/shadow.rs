@@ -755,12 +755,11 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
-/// `[from, to)` without the ranges of `skip`, in order.
-pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+/// Visit `[from, to)` outside the ranges in `skip`, in order.
+pub(crate) fn outside(from: usize, to: usize, skip: &mut [(usize, usize)], mut visit: impl FnMut(usize, usize)) {
     skip.sort_unstable();
-    let mut out = Vec::new();
     let mut at = from;
-    for (a, b) in skip {
+    for &(a, b) in skip.iter() {
         if b <= at {
             continue;
         }
@@ -768,14 +767,13 @@ pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> 
             break;
         }
         if a > at {
-            out.push((at, a));
+            visit(at, a);
         }
         at = at.max(b);
     }
     if at < to {
-        out.push((at, to));
+        visit(at, to);
     }
-    out
 }
 
 /// The runs of 4-byte words of title memory (cut on its addresses;
@@ -990,10 +988,15 @@ mod relay_tests {
 
     #[test]
     fn ranges_are_cut_out() {
-        assert_eq!(outside(10, 50, vec![]), vec![(10, 50)]);
-        assert_eq!(outside(10, 50, vec![(0, 10), (50, 60)]), vec![(10, 50)]);
-        assert_eq!(outside(10, 50, vec![(30, 35), (0, 12), (34, 40), (48, 99)]), vec![(12, 30), (40, 48)]);
-        assert_eq!(outside(10, 50, vec![(0, 99)]), vec![]);
+        let spans = |skip: &mut [(usize, usize)]| {
+            let mut kept = Vec::new();
+            outside(10, 50, skip, |a, b| kept.push((a, b)));
+            kept
+        };
+        assert_eq!(spans(&mut []), [(10, 50)]);
+        assert_eq!(spans(&mut [(0, 10), (50, 60)]), [(10, 50)]);
+        assert_eq!(spans(&mut [(30, 35), (0, 12), (34, 40), (48, 99)]), [(12, 30), (40, 48)]);
+        assert!(spans(&mut [(0, 99)]).is_empty());
     }
 
     /// A model of a copy in the PC's memory under the relay: the card
@@ -1118,13 +1121,13 @@ mod relay_tests {
             card[a..b].copy_from_slice(&cpu[a..b]);
         }
         // The merge leaves out what went up after the fetch.
-        let skip: Vec<(usize, usize)> = noted.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)).collect();
+        let mut skip: Vec<(usize, usize)> = noted.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)).collect();
         let mut changed = false;
-        for (a, b) in outside(0, N, skip) {
+        outside(0, N, &mut skip, |a, b| {
             let mut t = title[a..b].to_vec();
             changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t);
             title[a..b].copy_from_slice(&t);
-        }
+        });
         assert!(changed);
         // A's bytes arrived; the title's two writes stand, in title memory
         // and on both sides of the copy.
@@ -3539,7 +3542,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
+        let mut skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty
@@ -3556,12 +3559,12 @@ impl Shadow {
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
         let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
+        outside(at, at + n, &mut skip, |a, b| {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
+        });
         if !mapped || !changed {
             return 0;
         }

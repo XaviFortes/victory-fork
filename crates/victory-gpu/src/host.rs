@@ -4845,6 +4845,9 @@ impl Host {
                 )
             };
             let slots = inflight.fetched.2;
+            let mut tickets = std::collections::HashMap::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut newer = Vec::new();
             for plan in plans {
                 if plan.ranges.is_empty() {
                     continue;
@@ -4853,7 +4856,7 @@ impl Host {
                     return false;
                 }
                 // Pieces (copy, number) the compare flagged, with their ticket.
-                let mut tickets: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
+                tickets.clear();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -4873,7 +4876,7 @@ impl Host {
                         }
                     }
                 }
-                let mut seen = std::collections::HashSet::new();
+                seen.clear();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -4891,15 +4894,15 @@ impl Host {
                         }
                         let slot = inflight.fetched.1 + (k % slots) as usize * INFLIGHT_SLOT as usize;
                         // Bytes a fetch the old way brought after this flight ran.
-                        let newer: Vec<(usize, usize)> = inflight
-                            .brought
-                            .iter()
-                            .filter(|b| b.3 >= plan.sent_as && Arc::ptr_eq(&b.0, &r.shadow) && b.1 < hi && b.2 > lo)
-                            .map(|b| (b.1, b.2))
-                            .collect();
-                        for (a, b) in crate::shadow::outside(lo, hi, newer) {
+                        newer.clear();
+                        newer.extend(
+                            inflight.brought.iter()
+                                .filter(|b| b.3 >= plan.sent_as && Arc::ptr_eq(&b.0, &r.shadow) && b.1 < hi && b.2 > lo)
+                                .map(|b| (b.1, b.2)),
+                        );
+                        crate::shadow::outside(lo, hi, &mut newer, |a, b| {
                             pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
-                        }
+                        });
                     }
                 }
             }
