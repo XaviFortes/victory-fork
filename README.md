@@ -67,6 +67,17 @@ same scene with `VICTORY_CARD_HASH_WIDE=0` and `VICTORY_CARD_HASH_WIDE=1` in
 separate launches. Keep `VICTORY_CARD_REHASH_RUNS=1` in both to match the
 capture. Compare median frame time and GPU send-and-hash and compare times.
 
+With the parallel hash enabled, the final gameplay windows had medians of
+132–141 ms and GPU send-and-hash times of about 3 ms per frame. The relay
+still spent about 29–38 ms per frame waiting for readback in closing samples.
+Its log now reports the number of explicit readback copy commands and the
+spans they cover. Adjacent spans of the same GPU buffer can share a command.
+
+For a separate readback comparison, keep `VICTORY_CARD_HASH_WIDE=1` and
+`VICTORY_CARD_REHASH_RUNS=1` and try `VICTORY_CARD_FETCH_INFLIGHT=0` and `1`
+in separate launches with `VICTORY_QUEUE2=0`. Compare median frame time,
+relay fetch waits, and how often the in-flight path falls back to a fetch.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
