@@ -415,19 +415,23 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+pub(crate) fn join_piece_runs(runs: &mut Vec<CardSpan>) {
     runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
+    let mut kept = 0;
+    for index in 0..runs.len() {
+        let run = runs[index];
+        match runs[..kept].last_mut() {
             Some(last) if run.first <= last.first + last.pieces => {
                 last.pieces = last.pieces.max(run.first + run.pieces - last.first);
                 last.to = last.to.max(run.to);
             }
-            _ => out.push(run),
+            _ => {
+                runs[kept] = run;
+                kept += 1;
+            }
         }
     }
-    out
+    runs.truncate(kept);
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -466,7 +470,7 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, join_piece_runs, joined};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -478,16 +482,18 @@ mod card_tests {
             pieces,
             skew: 7,
         };
-        let runs = vec![run(40, 1), run(3, 2), run(4, 1), run(5, 3), run(40, 1), run(9, 1), run(41, 2), run(100, 1)];
+        let mut runs = vec![run(40, 1), run(3, 2), run(4, 1), run(5, 3), run(40, 1), run(9, 1), run(41, 2), run(100, 1)];
         let mut wanted: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         wanted.sort_unstable();
         wanted.dedup();
-        let joined = joined_piece_runs(runs);
-        let got: Vec<u32> = joined.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+        join_piece_runs(&mut runs);
+        let got: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         assert_eq!(got, wanted);
-        assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
-        assert!(joined.iter().all(|r| r.skew == 7));
-        assert!(joined_piece_runs(Vec::new()).is_empty());
+        assert_eq!(runs.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
+        assert!(runs.iter().all(|r| r.skew == 7));
+        runs.clear();
+        join_piece_runs(&mut runs);
+        assert!(runs.is_empty());
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
